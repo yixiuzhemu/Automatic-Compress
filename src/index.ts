@@ -46,6 +46,13 @@ const SUMMARY_MAX_CHARS = 120
 /** Text sent when auto-continuing a truncated turn. */
 const CONTINUE_TEXT = '继续'
 
+/**
+ * Manual-compaction refusal when the agent cannot enter maintenance. Shared
+ * by the idle pre-check and the engine's own `busy` failure so both paths
+ * read identically.
+ */
+const BUSY_DETAIL = 'The session is not idle (a turn is running or another compaction owns it). Retry when it is idle.'
+
 /** Default max auto-continue count per session. */
 const DEFAULT_MAX_AUTO_CONTINUES = 2
 
@@ -117,14 +124,49 @@ interface TokenMeterService {
 /**
  * The runtime Agent shape this plugin stores for manual compaction.
  * The full runtime Agent (from agent-loop) provides `runMaintenance`,
- * `session`, and `options` that `compaction.compactNow()` requires.
+ * `session`, `ctx`, and `options` that `compaction.compactNow()` requires.
  */
 interface RuntimeAgent {
   readonly id: string
   readonly session: unknown
+  /** Agent-scoped context: the identity `agentPresets.serviceFor()` keys by
+   *  to find this agent's preset composition (its isolated `compaction`). */
+  readonly ctx?: unknown
+  /** Current lifecycle state; anything but `'idle'` guarantees the engine's
+   *  maintenance claim fails with a `busy` error. */
+  readonly status?: string
   readonly options?: { provider?: string; model?: string }
   runMaintenance?<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>
   followup?(message: unknown): void
+}
+
+/**
+ * The subset of `ctx.agentPresets` this plugin reads. A preset publishes
+ * `compaction` behind an `isolate` realm (so two sessions cannot collide),
+ * and that realm is invisible to the host plane — `ctx.get('compaction')`
+ * there can never resolve the session's engine. `serviceFor()` is the
+ * documented read path for a caller that holds the agent and asks ABOUT its
+ * session — exactly this plugin's manual compaction, driven by a browser RPC.
+ */
+interface AgentPresetsService {
+  /**
+   * One agent's instance of a service its preset mounted.
+   * @param agent - the agent whose composition to look inside.
+   * @param name - the service name as the preset's rows resolve it.
+   * @returns the agent's instance, or undefined when its preset mounts none.
+   */
+  serviceFor(agent: { ctx: unknown }, name: string): unknown
+}
+
+/** The subset of `ctx.agents` (the AgentRegistry) this plugin reads. */
+interface AgentRegistryService {
+  get?(id: string): RuntimeAgent | undefined
+  list?(): RuntimeAgent[]
+}
+
+/** The subset of a session's `compaction` engine this plugin calls. */
+interface CompactionService {
+  compactNow(agent: unknown, signal: AbortSignal): Promise<unknown>
 }
 
 /** Minimal session shape for `session.append()` and `session.id`. */
@@ -171,6 +213,9 @@ export interface CompressStatusSnapshot {
   maxTokens: number
   /** Last compression outcome, if any. */
   lastOutcome: 'success' | 'skipped' | 'error' | undefined
+  /** Human-readable detail for the last outcome, if any. Persisted so a
+   *  fresh client mount can explain a stale `error` state. */
+  lastDetail?: string
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -223,6 +268,10 @@ export class AutomaticCompress extends TypertRemoteService {
   private latestUsagePercent = 0
   private latestCurrentTokens = 0
   private latestOutcome: CompressStatusSnapshot['lastOutcome']
+  /** Human-readable detail for the last outcome, persisted so `getStatus()`
+   *  can replay it on a fresh client mount (otherwise a stale `error`
+   *  outcome renders with no explanation). */
+  private latestDetail: string | undefined
   /** The most recently seen session id, updated on every pre-step. */
   private latestSessionId: string | undefined
   /** The most recently seen Session object, for projection reads.
@@ -397,6 +446,7 @@ export class AutomaticCompress extends TypertRemoteService {
       currentTokens: this.latestCurrentTokens,
       maxTokens: this.latestContextWindow ?? DEFAULT_MAX_TOKENS,
       lastOutcome: this.latestOutcome,
+      lastDetail: this.latestDetail,
     }
     log(`getStatus() called by client — returning: ${JSON.stringify(result)}`)
     return result
@@ -410,22 +460,39 @@ export class AutomaticCompress extends TypertRemoteService {
    */
   @Remote
   async compactNow(): Promise<{ outcome: 'success' | 'skipped' | 'error'; detail?: string }> {
-    const agent = this.latestAgentRef
     const sessionId = this.latestSessionId
-    if (agent === undefined || sessionId === undefined) {
-      return { outcome: 'error', detail: 'no active session' }
+    if (sessionId === undefined) {
+      return this.record('error', 'no active session')
+    }
+
+    // Resolve the agent dynamically: `latestAgentRef` is only captured from
+    // `agent/pre-step`, which Web/Desktop profiles need not route through
+    // this plugin. The AgentRegistry keys live agents by session id.
+    const agent = this.resolveAgent(sessionId)
+    if (agent === undefined) {
+      log(`manual compaction for session ${sessionId}: no live agent found`)
+      return this.record('error', 'no live agent found for the current session')
     }
     if (this.compressing.has(sessionId)) {
-      return { outcome: 'skipped', detail: 'already compressing' }
+      return this.record('skipped', 'already compressing')
     }
 
-    // Resolve the compaction service at runtime (may not be available).
-    const compaction = this.selfCtx.get('compaction') as {
-      compactNow(agent: unknown, signal: AbortSignal): Promise<unknown>
-    } | undefined
+    // A running agent can never enter maintenance; answer with the same
+    // wording the engine's own `busy` failure would produce.
+    if (agent.status !== undefined && agent.status !== 'idle') {
+      log(`manual compaction for session ${sessionId}: agent status=${agent.status}`)
+      return this.record('error', BUSY_DETAIL)
+    }
 
+    // Resolve the session's own compaction engine (preset realm first, then
+    // the host plane). See `resolveCompaction` for why order matters.
+    const compaction = this.resolveCompaction(agent)
     if (compaction === undefined) {
-      return { outcome: 'error', detail: 'compaction service not available' }
+      log(`manual compaction for session ${sessionId}: no compaction engine resolved`)
+      return this.record(
+        'error',
+        'compaction service not available (no preset engine and no host-plane engine)',
+      )
     }
 
     this.compressing.add(sessionId)
@@ -438,34 +505,151 @@ export class AutomaticCompress extends TypertRemoteService {
 
       if (result !== null && result !== undefined) {
         log(`manual compaction completed for session ${sessionId}`)
-        this.latestOutcome = 'success'
         this.selfCtx.emit('automatic-compress/done', {
           sessionId,
           outcome: 'success',
         })
-        return { outcome: 'success' }
+        return this.record('success')
       } else {
-        log(`manual compaction skipped for session ${sessionId}`)
-        this.latestOutcome = 'skipped'
+        log(`manual compaction skipped for session ${sessionId} (no compactable history)`)
         this.selfCtx.emit('automatic-compress/done', {
           sessionId,
           outcome: 'skipped',
         })
-        return { outcome: 'skipped' }
+        return this.record('skipped')
       }
     } catch (error: unknown) {
-      const detail = error instanceof Error ? error.message : String(error)
-      log(`manual compaction failed for session ${sessionId}`)
-      this.latestOutcome = 'error'
+      const detail = AutomaticCompress.describeCompactionError(error)
+      log(`manual compaction failed for session ${sessionId}: ${detail}`)
       this.selfCtx.emit('automatic-compress/done', {
         sessionId,
         outcome: 'error',
         detail,
       })
-      return { outcome: 'error', detail }
+      return this.record('error', detail)
     } finally {
       this.compressing.delete(sessionId)
       this.latestPhase = 'idle'
+    }
+  }
+
+  /**
+   * Persist one compaction outcome on the snapshot AND return it as the
+   * Remote result. Every `compactNow` exit path routes through here so
+   * `getStatus()` can always replay the latest outcome together with its
+   * detail on a fresh client mount — without it, a stale `error` outcome
+   * rendered in the popover with no explanation (the detail was only ever
+   * returned to the originating call, never persisted).
+   * @param outcome - the result classification.
+   * @param detail - human-readable reason; omitted for a clean success.
+   * @returns the same outcome/detail pair as the Remote return value.
+   */
+  private record(
+    outcome: 'success' | 'skipped' | 'error',
+    detail?: string,
+  ): { outcome: 'success' | 'skipped' | 'error'; detail?: string } {
+    this.latestOutcome = outcome
+    this.latestDetail = detail
+    return detail === undefined ? { outcome } : { outcome, detail }
+  }
+
+  /**
+   * Resolve the live runtime agent for a session.
+   *
+   * `latestAgentRef` is only populated by `agent/pre-step`, which Web/Desktop
+   * profiles may never route through this plugin (the agent plane lives
+   * inside each session's preset composition). The AgentRegistry is the
+   * authoritative source instead: a live agent's `id` IS its session id, so
+   * `agents.get(sessionId)` resolves it, with a session-identity fallback
+   * over `list()` for registry implementations without `get()`.
+   * @param sessionId - the tracked session identity, when one exists.
+   * @returns the live agent, or undefined when none is registered.
+   */
+  private resolveAgent(sessionId: string | undefined): RuntimeAgent | undefined {
+    // Fast path: the agent captured from `agent/pre-step` still owns the
+    // tracked session (or there is no tracked session to disagree with).
+    if (this.latestAgentRef !== undefined && (sessionId === undefined || this.latestAgentRef.id === sessionId)) {
+      return this.latestAgentRef
+    }
+    if (sessionId === undefined) return undefined
+    try {
+      const agents = this.selfCtx.get('agents', false) as AgentRegistryService | undefined
+      if (agents === undefined) return undefined
+      const byId = agents.get?.(sessionId)
+      if (byId !== undefined) return byId
+      const list = agents.list?.() ?? []
+      return list.find(a => a?.session === this.latestSessionRef)
+        ?? list.find(a => a?.session === this.canonicalSessionRef)
+        ?? list.find(a => (a?.session as { id?: string } | undefined)?.id === sessionId)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Resolve the compaction engine that belongs to the agent's session.
+   *
+   * Web/Desktop profiles mount each session's composition as a preset with
+   * `compaction` behind an `isolate` realm, so the host plane's store can
+   * never hold that session's engine — a host-plane `ctx.get('compaction')`
+   * yields a root-plane instance at best, which is not the engine a
+   * browser-driven request must call. `agentPresets.serviceFor(agent,
+   * 'compaction')` is the documented read path for a request ABOUT a session
+   * arriving from outside it; the root store remains the fallback for
+   * compositions that keep compaction on the host plane (TUI/headless).
+   * @param agent - the live agent whose composition to look inside.
+   * @returns the engine, or undefined when neither source provides one.
+   */
+  private resolveCompaction(agent: RuntimeAgent): CompactionService | undefined {
+    try {
+      const presets = this.selfCtx.get('agentPresets', false) as AgentPresetsService | undefined
+      if (presets !== undefined && agent.ctx !== undefined) {
+        const engine = presets.serviceFor({ ctx: agent.ctx }, 'compaction') as CompactionService | undefined
+        if (engine !== undefined && typeof engine.compactNow === 'function') {
+          log('resolveCompaction: using the session preset\'s isolated compaction engine')
+          return engine
+        }
+      }
+    } catch (error: unknown) {
+      log(`resolveCompaction: preset lookup failed: ${String(error)}`)
+    }
+    try {
+      const engine = this.selfCtx.get('compaction', false) as CompactionService | undefined
+      if (engine !== undefined && typeof engine.compactNow === 'function') {
+        log('resolveCompaction: using the host-plane compaction engine')
+        return engine
+      }
+    } catch (error: unknown) {
+      log(`resolveCompaction: host-plane lookup failed: ${String(error)}`)
+    }
+    return undefined
+  }
+
+  /**
+   * Turn a compaction failure into a concise, actionable detail string.
+   * `ManualCompactionError` is structural here — its package is not a
+   * dependency of this plugin — so classification reads the `code` property
+   * directly, mirroring dsh's own `/compact` wording for each class.
+   * @param error - the failure thrown by the engine.
+   * @returns a human-readable detail.
+   */
+  private static describeCompactionError(error: unknown): string {
+    const code = (error as { code?: unknown } | null | undefined)?.code
+    switch (code) {
+      case 'busy':
+        return BUSY_DETAIL
+      case 'cancelled':
+        return 'Compaction was cancelled; the conversation is unchanged.'
+      case 'changed':
+        return 'The history selected for compaction changed before it could be replaced. The conversation is unchanged.'
+      case 'summary':
+        return 'Compaction could not produce a useful summary. The conversation is unchanged.'
+      case 'commit':
+        return 'Compaction did not finish cleanly; some session history may have changed.'
+      case 'persistence':
+        return 'Compaction finished, but the session could not be saved.'
+      default:
+        return error instanceof Error ? error.message : String(error)
     }
   }
 
