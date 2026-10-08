@@ -41,7 +41,7 @@ Example `cordis.patch.yml`:
 ```yaml
 - insert:
     - id: automatic-compress
-      name: '@automatic-compress/automatic-compress'
+      name: '@dtranx/automatic-compress'
       config:
         enabled: true
         toolName: compact_context

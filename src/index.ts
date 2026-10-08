@@ -7,7 +7,7 @@
  * (80% of the model's context window). This plugin only observes and exposes
  * the data for the UI, plus offers a manual "Compact" button.
  *
- * @module @automatic-compress/automatic-compress
+ * @module @dtranx/automatic-compress
  */
 
 import { randomUUID } from 'node:crypto'

@@ -3,7 +3,7 @@
  * status the host publishes and the client renders, plus the Cordis events
  * that announce compression lifecycle transitions.
  *
- * @module @automatic-compress/automatic-compress/types
+ * @module @dtranx/automatic-compress/types
  */
 
 declare module '@deepseek-ai/cordis' {

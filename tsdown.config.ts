@@ -12,7 +12,7 @@ import { basename, dirname, relative, resolve as resolvePath } from 'node:path'
 import { defineConfig } from 'tsdown'
 import { transform } from 'lightningcss'
 
-const id = '@automatic-compress/automatic-compress'
+const id = '@dtranx/automatic-compress'
 
 /**
  * Externals resolved from the loader module table at runtime. The dsh client

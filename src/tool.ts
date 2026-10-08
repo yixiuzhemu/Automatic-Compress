@@ -6,7 +6,7 @@
  * Constructed as a plain `ToolDefinition` object because `dsh-tools` is
  * not a build-time dependency — the harness provides `ctx.tools` at runtime.
  *
- * @module @automatic-compress/automatic-compress/tool
+ * @module @dtranx/automatic-compress/tool
  */
 
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
