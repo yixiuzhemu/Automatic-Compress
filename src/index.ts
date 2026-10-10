@@ -57,14 +57,25 @@ const BUSY_DETAIL = 'The session is not idle (a turn is running or another compa
 const DEFAULT_MAX_AUTO_CONTINUES = 2
 
 /**
- * Terminal logger: writes directly to stderr so logs appear in the terminal
- * (including WebStorm Terminal when running under the desktop host).
- * All diagnostic output uses this function instead of `ctx.logger` because
- * the Cordis logger fills a ring buffer that is not visible in the terminal
- * unless an exporter is mounted, which the desktop profile does not do.
+ * Startup-level terminal logger: writes directly to stderr so logs appear
+ * in the terminal (including WebStorm Terminal when running under the
+ * desktop host). Only used for startup/loading messages that should always
+ * be visible. Runtime diagnostic output uses {@link debug} instead.
  * @param message - log message to write.
  */
 function log(message: string): void {
+  console.error(`[automatic-compress] ${message}`)
+}
+
+/**
+ * Debug-level terminal logger: only writes when `LOG_LEVEL=debug`.
+ * All runtime diagnostic output (event handlers, token refresh cycles,
+ * projection reads, etc.) routes through this function so the terminal
+ * stays quiet unless the user explicitly enables debug logging.
+ * @param message - debug message to write.
+ */
+function debug(message: string): void {
+  if (process.env.LOG_LEVEL !== 'debug') return
   console.error(`[automatic-compress] ${message}`)
 }
 
@@ -333,7 +344,7 @@ export class AutomaticCompress extends TypertRemoteService {
     // session and agent reference. Automatic compression is handled by
     // dsh's built-in BasicCompactionEngine (80% of contextWindow).
     ctx.on('agent/pre-step', async (payload: AgentPreStepPayload, next: () => Promise<unknown>) => {
-      log(`agent/pre-step fired — agentId=${payload.agent.id} agentStatus=${payload.agent.status}`)
+      debug(`agent/pre-step fired — agentId=${payload.agent.id} agentStatus=${payload.agent.status}`)
       this.trackSession(payload)
       return next()
     })
@@ -348,9 +359,7 @@ export class AutomaticCompress extends TypertRemoteService {
     this.sessionProjections = ctx.get('sessionProjections', false) as SessionProjectionRegistryService | undefined
     this.tokenMeter = ctx.get('tokenMeter', false) as TokenMeterService | undefined
 
-    log(
-      `service resolution: sessionProjections=${this.sessionProjections !== undefined}, tokenMeter=${this.tokenMeter !== undefined}`,
-    )
+    debug(`service resolution: sessionProjections=${this.sessionProjections !== undefined}, tokenMeter=${this.tokenMeter !== undefined}`,)
 
     // Set up the projection change listener now that sessionProjections is available.
     this.setupProjectionMonitoring(ctx)
@@ -370,8 +379,7 @@ export class AutomaticCompress extends TypertRemoteService {
 
       // Diagnostic: log the first few session events to verify the handler fires.
       if (this.sessionEventCount <= 5) {
-        log(
-          `session/event #${this.sessionEventCount} type=${eventType ?? '?'}`
+        debug(`session/event #${this.sessionEventCount} type=${eventType ?? '?'}`
           + ` sessionId=${sessionId ?? '?'}`
           + ` hasSP=${this.sessionProjections !== undefined} hasTM=${this.tokenMeter !== undefined}`
           + ` trackedSession=${this.latestSessionId ?? 'none'}`,
@@ -385,7 +393,7 @@ export class AutomaticCompress extends TypertRemoteService {
         this.latestSessionId = sessionId
         this.latestSessionRef = session
         this.canonicalSessionRef = session
-        log(`session tracking initialized from session/event (id=${sessionId})`)
+        debug(`session tracking initialized from session/event (id=${sessionId})`)
         // Diagnostic: try an immediate projection read to verify data availability.
         this.diagnoseProjectionRead(session)
         // Trigger an immediate status refresh now that we have a session.
@@ -448,7 +456,7 @@ export class AutomaticCompress extends TypertRemoteService {
       lastOutcome: this.latestOutcome,
       lastDetail: this.latestDetail,
     }
-    log(`getStatus() called by client — returning: ${JSON.stringify(result)}`)
+    debug(`getStatus() called by client — returning: ${JSON.stringify(result)}`)
     return result
   }
 
@@ -470,7 +478,7 @@ export class AutomaticCompress extends TypertRemoteService {
     // this plugin. The AgentRegistry keys live agents by session id.
     const agent = this.resolveAgent(sessionId)
     if (agent === undefined) {
-      log(`manual compaction for session ${sessionId}: no live agent found`)
+      debug(`manual compaction for session ${sessionId}: no live agent found`)
       return this.record('error', 'no live agent found for the current session')
     }
     if (this.compressing.has(sessionId)) {
@@ -480,7 +488,7 @@ export class AutomaticCompress extends TypertRemoteService {
     // A running agent can never enter maintenance; answer with the same
     // wording the engine's own `busy` failure would produce.
     if (agent.status !== undefined && agent.status !== 'idle') {
-      log(`manual compaction for session ${sessionId}: agent status=${agent.status}`)
+      debug(`manual compaction for session ${sessionId}: agent status=${agent.status}`)
       return this.record('error', BUSY_DETAIL)
     }
 
@@ -488,7 +496,7 @@ export class AutomaticCompress extends TypertRemoteService {
     // the host plane). See `resolveCompaction` for why order matters.
     const compaction = this.resolveCompaction(agent)
     if (compaction === undefined) {
-      log(`manual compaction for session ${sessionId}: no compaction engine resolved`)
+      debug(`manual compaction for session ${sessionId}: no compaction engine resolved`)
       return this.record(
         'error',
         'compaction service not available (no preset engine and no host-plane engine)',
@@ -504,14 +512,14 @@ export class AutomaticCompress extends TypertRemoteService {
       const result = await compaction.compactNow(agent, signal)
 
       if (result !== null && result !== undefined) {
-        log(`manual compaction completed for session ${sessionId}`)
+        debug(`manual compaction completed for session ${sessionId}`)
         this.selfCtx.emit('automatic-compress/done', {
           sessionId,
           outcome: 'success',
         })
         return this.record('success')
       } else {
-        log(`manual compaction skipped for session ${sessionId} (no compactable history)`)
+        debug(`manual compaction skipped for session ${sessionId} (no compactable history)`)
         this.selfCtx.emit('automatic-compress/done', {
           sessionId,
           outcome: 'skipped',
@@ -520,7 +528,7 @@ export class AutomaticCompress extends TypertRemoteService {
       }
     } catch (error: unknown) {
       const detail = AutomaticCompress.describeCompactionError(error)
-      log(`manual compaction failed for session ${sessionId}: ${detail}`)
+      debug(`manual compaction failed for session ${sessionId}: ${detail}`)
       this.selfCtx.emit('automatic-compress/done', {
         sessionId,
         outcome: 'error',
@@ -606,21 +614,21 @@ export class AutomaticCompress extends TypertRemoteService {
       if (presets !== undefined && agent.ctx !== undefined) {
         const engine = presets.serviceFor({ ctx: agent.ctx }, 'compaction') as CompactionService | undefined
         if (engine !== undefined && typeof engine.compactNow === 'function') {
-          log('resolveCompaction: using the session preset\'s isolated compaction engine')
+          debug('resolveCompaction: using the session preset\'s isolated compaction engine')
           return engine
         }
       }
     } catch (error: unknown) {
-      log(`resolveCompaction: preset lookup failed: ${String(error)}`)
+      debug(`resolveCompaction: preset lookup failed: ${String(error)}`)
     }
     try {
       const engine = this.selfCtx.get('compaction', false) as CompactionService | undefined
       if (engine !== undefined && typeof engine.compactNow === 'function') {
-        log('resolveCompaction: using the host-plane compaction engine')
+        debug('resolveCompaction: using the host-plane compaction engine')
         return engine
       }
     } catch (error: unknown) {
-      log(`resolveCompaction: host-plane lookup failed: ${String(error)}`)
+      debug(`resolveCompaction: host-plane lookup failed: ${String(error)}`)
     }
     return undefined
   }
@@ -699,7 +707,7 @@ export class AutomaticCompress extends TypertRemoteService {
       }, { surfaceOp: 'append' })
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
-      log(`automatic-compress: could not append notice: ${msg}`)
+      debug(`automatic-compress: could not append notice: ${msg}`)
     }
   }
 
@@ -834,7 +842,7 @@ export class AutomaticCompress extends TypertRemoteService {
         register(definition: unknown): () => void
       } | undefined
       if (tools === undefined) {
-        log('automatic-compress: ctx.tools not available, agent tool not registered')
+        debug('automatic-compress: ctx.tools not available, agent tool not registered')
         return
       }
 
@@ -875,10 +883,10 @@ export class AutomaticCompress extends TypertRemoteService {
       }
 
       tools.register(definition)
-      log(`automatic-compress: agent tool "${this.config.toolName}" registered`)
+      debug(`automatic-compress: agent tool "${this.config.toolName}" registered`)
     } catch (error: unknown) {
       const detail = error instanceof Error ? error.message : String(error)
-      log(`automatic-compress: failed to register agent tool: ${detail}`)
+      debug(`automatic-compress: failed to register agent tool: ${detail}`)
     }
   }
 
@@ -920,11 +928,11 @@ export class AutomaticCompress extends TypertRemoteService {
   private setupProjectionMonitoring(ctx: Context): void {
     if (this.sessionProjections !== undefined) {
       this.sessionProjections.onChanged((session, key, value, seq) => {
-        log(`[AC] onChanged fired — key=${key} seq=${seq} value=${JSON.stringify(value)}`)
+        debug(`[AC] onChanged fired — key=${key} seq=${seq} value=${JSON.stringify(value)}`)
         if (key !== 'contextPressure') return
         // Match by either the tracked ref or the canonical session ref.
         if (session !== this.latestSessionRef && session !== this.canonicalSessionRef) {
-          log(`[AC] onChanged: session ref mismatch — skipping`)
+          debug(`[AC] onChanged: session ref mismatch — skipping`)
           return
         }
         if (this.latestSessionId !== undefined) {
@@ -945,34 +953,28 @@ export class AutomaticCompress extends TypertRemoteService {
    */
   private diagnoseProjectionRead(session: unknown): void {
     if (this.sessionProjections === undefined) {
-      log('[AC] [diag] sessionProjections unavailable — cannot read projections')
+      debug('[AC] [diag] sessionProjections unavailable — cannot read projections')
       return
     }
     try {
       const state = this.sessionProjections.stateOf(session, 'contextPressure') as ContextPressureState | undefined
-      log(
-        `[AC] [diag] stateOf(contextPressure) = ${state !== undefined ? JSON.stringify(state) : 'undefined'}`,
-      )
+      debug(`[AC] [diag] stateOf(contextPressure) = ${state !== undefined ? JSON.stringify(state) : 'undefined'}`,)
       if (state !== undefined) {
         const snap = this.sessionProjections.snapshot(session, ['contextPressure'])
-        log(
-          `[AC] [diag] snapshot(contextPressure) = ${JSON.stringify(snap?.values?.contextPressure ?? 'undefined')}`,
-        )
+        debug(`[AC] [diag] snapshot(contextPressure) = ${JSON.stringify(snap?.values?.contextPressure ?? 'undefined')}`,)
       }
     } catch (error) {
-      log(`[AC] [diag] projection read failed: ${String(error)}`)
+      debug(`[AC] [diag] projection read failed: ${String(error)}`)
     }
     if (this.tokenMeter !== undefined) {
       try {
         const measurement = this.tokenMeter.measure(session)
-        log(
-          `[AC] [diag] tokenMeter.measure() = totalTokens=${measurement.totalTokens} surfaceTokens=${measurement.surfaceTokens}`,
-        )
+        debug(`[AC] [diag] tokenMeter.measure() = totalTokens=${measurement.totalTokens} surfaceTokens=${measurement.surfaceTokens}`,)
       } catch (error) {
-        log(`[AC] [diag] tokenMeter.measure() failed: ${String(error)}`)
+        debug(`[AC] [diag] tokenMeter.measure() failed: ${String(error)}`)
       }
     } else {
-      log('[AC] [diag] tokenMeter unavailable')
+      debug('[AC] [diag] tokenMeter unavailable')
     }
   }
 
@@ -993,21 +995,19 @@ export class AutomaticCompress extends TypertRemoteService {
    */
   private refreshAndEmit(): void {
     if (this.latestSessionId === undefined) {
-      log('[AC] refreshAndEmit: SKIP — no sessionId yet')
+      debug('[AC] refreshAndEmit: SKIP — no sessionId yet')
       return
     }
 
     const sessionForRead = this.canonicalSessionRef ?? this.latestSessionRef
     if (sessionForRead === undefined) {
-      log('[AC] refreshAndEmit: SKIP — no session ref')
+      debug('[AC] refreshAndEmit: SKIP — no session ref')
       return
     }
 
-    log(
-      `[AC] refreshAndEmit: sessionId=${this.latestSessionId}`
+    debug(`[AC] refreshAndEmit: sessionId=${this.latestSessionId}`
       + ` hasSP=${this.sessionProjections !== undefined} hasTM=${this.tokenMeter !== undefined}`
-      + ` sessionRef=${this.canonicalSessionRef !== undefined ? 'canonical' : this.latestSessionRef !== undefined ? 'agent' : 'none'}`,
-    )
+      + ` sessionRef=${this.canonicalSessionRef !== undefined ? 'canonical' : this.latestSessionRef !== undefined ? 'agent' : 'none'}`,)
 
     // Path 1: `tokenMeter.measure()` — dsh's own status bar data source.
     // This is THE proven source: it replays the session surface and returns
@@ -1015,21 +1015,21 @@ export class AutomaticCompress extends TypertRemoteService {
     if (this.tokenMeter !== undefined) {
       try {
         const measurement = this.tokenMeter.measure(sessionForRead)
-        log(`[AC] Path1 tokenMeter.measure() = totalTokens=${measurement.totalTokens} surfaceTokens=${measurement.surfaceTokens}`)
+        debug(`[AC] Path1 tokenMeter.measure() = totalTokens=${measurement.totalTokens} surfaceTokens=${measurement.surfaceTokens}`)
         if (measurement.totalTokens > 0) {
           this.latestCurrentTokens = measurement.totalTokens
           const maxTokens = this.latestContextWindow ?? DEFAULT_MAX_TOKENS
           this.latestUsagePercent = maxTokens > 0 ? Math.round((this.latestCurrentTokens / maxTokens) * 100) : 0
-          log(`[AC] Path1 HIT: ${measurement.totalTokens} tokens, ${this.latestUsagePercent}% of ${maxTokens}`)
+          debug(`[AC] Path1 HIT: ${measurement.totalTokens} tokens, ${this.latestUsagePercent}% of ${maxTokens}`)
           this.emitStatus(this.latestSessionId, this.latestPhase, this.latestUsagePercent, this.latestCurrentTokens)
           this.successfulRefreshCount++
           return
         }
       } catch (e) {
-        log(`[AC] Path1 FAILED: ${String(e)}`)
+        debug(`[AC] Path1 FAILED: ${String(e)}`)
       }
     } else {
-      log('[AC] Path1 SKIP: tokenMeter is undefined')
+      debug('[AC] Path1 SKIP: tokenMeter is undefined')
     }
 
     // Path 2: raw projection state via `stateOf()` — fallback when tokenMeter
@@ -1037,7 +1037,7 @@ export class AutomaticCompress extends TypertRemoteService {
     if (this.sessionProjections !== undefined) {
       try {
         const state = this.sessionProjections.stateOf(sessionForRead, 'contextPressure') as ContextPressureState | undefined
-        log(`[AC] Path2 stateOf() = ${state !== undefined ? JSON.stringify(state) : 'undefined'}`)
+        debug(`[AC] Path2 stateOf() = ${state !== undefined ? JSON.stringify(state) : 'undefined'}`)
         if (state !== undefined) {
           if (state.contextWindow !== undefined) {
             this.latestContextWindow = state.contextWindow
@@ -1048,26 +1048,26 @@ export class AutomaticCompress extends TypertRemoteService {
           } else {
             currentTokens = state.surfaceTokens
           }
-          log(`[AC] Path2: surfaceTokens=${state.surfaceTokens} pressureTokens=${state.pressureTokens ?? 'undef'} sampledSurfaceTokens=${state.sampledSurfaceTokens ?? 'undef'} → currentTokens=${currentTokens}`)
+          debug(`[AC] Path2: surfaceTokens=${state.surfaceTokens} pressureTokens=${state.pressureTokens ?? 'undef'} sampledSurfaceTokens=${state.sampledSurfaceTokens ?? 'undef'} → currentTokens=${currentTokens}`)
           if (currentTokens > 0) {
             this.latestCurrentTokens = currentTokens
             const maxTokens = this.latestContextWindow ?? DEFAULT_MAX_TOKENS
             this.latestUsagePercent = maxTokens > 0 ? Math.round((currentTokens / maxTokens) * 100) : 0
-            log(`[AC] Path2 HIT: ${currentTokens} tokens, ${this.latestUsagePercent}% of ${maxTokens}`)
+            debug(`[AC] Path2 HIT: ${currentTokens} tokens, ${this.latestUsagePercent}% of ${maxTokens}`)
             this.emitStatus(this.latestSessionId, this.latestPhase, this.latestUsagePercent, this.latestCurrentTokens)
             this.successfulRefreshCount++
             return
           }
         }
       } catch (e) {
-        log(`[AC] Path2 FAILED: ${String(e)}`)
+        debug(`[AC] Path2 FAILED: ${String(e)}`)
       }
 
       // Path 3: client view via `snapshot()` — last resort.
       try {
         const snap = this.sessionProjections!.snapshot(sessionForRead, ['contextPressure'])
         const view = snap?.values?.contextPressure as ContextPressureView | undefined
-        log(`[AC] Path3 snapshot() = ${view !== undefined ? JSON.stringify(view) : 'undefined'}`)
+        debug(`[AC] Path3 snapshot() = ${view !== undefined ? JSON.stringify(view) : 'undefined'}`)
         if (view !== undefined) {
           if (view.contextWindow !== undefined) {
             this.latestContextWindow = view.contextWindow
@@ -1077,20 +1077,20 @@ export class AutomaticCompress extends TypertRemoteService {
             this.latestCurrentTokens = currentTokens
             const maxTokens = this.latestContextWindow ?? DEFAULT_MAX_TOKENS
             this.latestUsagePercent = maxTokens > 0 ? Math.round((currentTokens / maxTokens) * 100) : 0
-            log(`[AC] Path3 HIT: ${currentTokens} tokens, ${this.latestUsagePercent}% of ${maxTokens}`)
+            debug(`[AC] Path3 HIT: ${currentTokens} tokens, ${this.latestUsagePercent}% of ${maxTokens}`)
             this.emitStatus(this.latestSessionId, this.latestPhase, this.latestUsagePercent, this.latestCurrentTokens)
             this.successfulRefreshCount++
             return
           }
         }
       } catch (e) {
-        log(`[AC] Path3 FAILED: ${String(e)}`)
+        debug(`[AC] Path3 FAILED: ${String(e)}`)
       }
     } else {
-      log('[AC] Path2+3 SKIP: sessionProjections is undefined')
+      debug('[AC] Path2+3 SKIP: sessionProjections is undefined')
     }
 
-    log(`[AC] refreshAndEmit: ALL PATHS ZERO — emitting 0/${this.latestContextWindow ?? DEFAULT_MAX_TOKENS}`)
+    debug(`[AC] refreshAndEmit: ALL PATHS ZERO — emitting 0/${this.latestContextWindow ?? DEFAULT_MAX_TOKENS}`)
     this.emitStatus(
       this.latestSessionId,
       this.latestPhase,
@@ -1127,7 +1127,7 @@ export class AutomaticCompress extends TypertRemoteService {
       currentTokens,
       maxTokens: this.latestContextWindow ?? DEFAULT_MAX_TOKENS,
     }
-    log(`[AC] emitStatus → ctx.emit('automatic-compress/status'): ${JSON.stringify(payload)}`)
+    debug(`[AC] emitStatus → ctx.emit('automatic-compress/status'): ${JSON.stringify(payload)}`)
     this.selfCtx.emit('automatic-compress/status', payload)
   }
 }
